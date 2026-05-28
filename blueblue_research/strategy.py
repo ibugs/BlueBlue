@@ -128,7 +128,8 @@ def generate_trades(scored: pd.DataFrame, config: Stage2Config, long_threshold: 
                 continue
             if pd.isna(entry_price) or pd.isna(exit_price) or entry_price == 0 or exit_price == 0:
                 continue
-            gross_return = exit_price / entry_price - 1 if side == "long" else entry_price / exit_price - 1
+            # SHFE.cu 是线性期货合约，空头收益按价格绝对变动线性结算。
+            gross_return = exit_price / entry_price - 1 if side == "long" else 1 - exit_price / entry_price
             net_return = gross_return - config.roundtrip_cost_price / entry_price
             rows.append(
                 {

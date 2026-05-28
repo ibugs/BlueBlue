@@ -51,4 +51,4 @@
 | BLOCKER | strategy | trade_overlap | PASS | 同合约交易不重叠 | 0 |  |
 | BLOCKER | strategy | train_test_boundary | PASS | 训练集交易不穿越测试边界 | 0 |  |
 | BLOCKER | strategy | threshold_direction | PASS | 交易方向符合训练集阈值 | 0 |  |
-| OBSERVATION | strategy | negative_test_return | INFO | 测试集平均净收益为负，属于研究反馈 | 7486 | avg_net_return=-0.00024314821556704877 |
+| OBSERVATION | strategy | negative_test_return | INFO | 测试集平均净收益为负，属于研究反馈 | 7486 | avg_net_return=-0.00024633273425555754 |

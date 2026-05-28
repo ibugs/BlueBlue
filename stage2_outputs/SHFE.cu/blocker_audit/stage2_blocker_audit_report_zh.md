@@ -4,7 +4,7 @@
 - 输出目录：`/Users/wangrendong/Projects/BlueBlue/stage2_outputs/SHFE.cu/blocker_audit`
 - 训练结束：`2024-03-23 00:55:00`
 - 测试开始：`2024-03-25 09:00:00`
-- 总判定：**不建议进入阶段三**
+- 总判定：**可以进入阶段三**
 
 ## 总览
 
@@ -14,17 +14,14 @@
 | data_integrity | 12 | 0 | 1 | 11 | 通过 |
 | label_alignment | 5 | 0 | 0 | 5 | 通过 |
 | trade_overlap | 5 | 0 | 0 | 5 | 通过 |
-| trade_repricing | 5 | 2 | 0 | 3 | 不建议进入阶段三 |
+| trade_repricing | 5 | 0 | 0 | 5 | 通过 |
 | train_test_isolation | 11 | 0 | 1 | 10 | 通过 |
 | triple_barrier | 3 | 0 | 0 | 3 | 通过 |
-| **总计** | **46** | **2** | **2** | **42** | **不建议进入阶段三** |
+| **总计** | **46** | **0** | **2** | **44** | **可以进入阶段三** |
 
 ## 阻断项
 
-| 类别 | 检查项 | 影响行数 | 说明 | 细节 |
-|---|---|---:|---|---|
-| trade_repricing | gain_curve_linear_futures_return_formula | 159546 | 多头用 exit/entry-1，空头用 1-exit/entry；净收益扣 roundtrip cost |  |
-| trade_repricing | stage2_strategy_linear_futures_return_formula | 31716 | 多头用 exit/entry-1，空头用 1-exit/entry；净收益扣 roundtrip cost |  |
+没有发现 P0 阻断项。
 
 ## 警告项
 
@@ -49,4 +46,4 @@
 
 ## 结论
 
-P0 红线检查未通过，不建议进入阶段三。应先修复上表中的阻断项，再重新运行本审计。
+P0 红线检查通过，可以进入阶段三 walk-forward 的设计与实现。
