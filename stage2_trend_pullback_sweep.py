@@ -11,6 +11,7 @@ def main() -> int:
     result = run(parse_args())
     print(f"output_dir={result['output_dir']}")
     print(f"contracts={result['contracts']}, rows={result['rows']}, parameter_cases={result['parameter_cases']}")
+    print(f"sides={result.get('sides', 'long')}")
     print(f"train_end={result['train_end']}, test_start={result['test_start']}")
     print(f"trades={result['trades']}, audit_blockers={result['audit_blockers']}")
     return 0
