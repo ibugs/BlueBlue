@@ -63,6 +63,9 @@ FEATURE_SPECS: List[Dict[str, str]] = [
     {"feature": "price_oi_state", "group": "open_interest", "description": "价格方向与持仓变化组合状态", "formula_note": "sign(close-prev_close)*sign(open_interest_change)"},
     {"feature": "delta_oi_agreement", "group": "open_interest", "description": "Delta方向与持仓变化一致性", "formula_note": "sign(delta)*sign(open_interest_change)"},
     {"feature": "oi_volume_ratio", "group": "open_interest", "description": "持仓变化占成交量比例", "formula_note": "open_interest_change/volume"},
+    {"feature": "open_interest_fracdiff_04", "group": "open_interest", "description": "持仓量0.4阶分数差分，降低非平稳性同时保留长记忆", "formula_note": "fractional_diff(open_interest, d=0.4)"},
+    {"feature": "open_interest_fracdiff_zscore_60", "group": "open_interest", "description": "持仓量分数差分60期标准分", "formula_note": "rolling_zscore(open_interest_fracdiff_04, 60)"},
+    {"feature": "fracdiff_oi_delta_confirm", "group": "open_interest", "description": "分数差分持仓方向与Delta方向确认", "formula_note": "sign(open_interest_fracdiff_04)*sign(delta)"},
     {"feature": "trend_return_12", "group": "regime_time", "description": "12期趋势收益", "formula_note": "close/close.shift(12)-1"},
     {"feature": "trend_return_48", "group": "regime_time", "description": "48期趋势收益", "formula_note": "close/close.shift(48)-1"},
     {"feature": "trend_strength_48", "group": "regime_time", "description": "波动调整后的48期趋势强度", "formula_note": "trend_return_48/(volatility_60*sqrt(48))"},
@@ -99,6 +102,33 @@ def rolling_zscore(series: pd.Series, window: int) -> pd.Series:
     mean = series.rolling(window, min_periods=window).mean()
     std = series.rolling(window, min_periods=window).std(ddof=0)
     return (series - mean) / std.replace(0, np.nan)
+
+
+def fractional_diff(series: pd.Series, order: float = 0.4, threshold: float = 1e-4, max_size: int = 200) -> pd.Series:
+    """固定宽度分数阶差分，用于降低长周期非平稳性。
+
+    权重只依赖历史值，按单合约调用，因此不会引入跨合约污染或未来函数。
+    """
+
+    weights = [1.0]
+    for k in range(1, max_size):
+        weight = -weights[-1] * (order - k + 1.0) / k
+        if abs(weight) < threshold:
+            break
+        weights.append(weight)
+    width = len(weights)
+    out = np.full(len(series), np.nan, dtype=float)
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    if len(values) < width:
+        return pd.Series(out, index=series.index)
+
+    windows = np.lib.stride_tricks.sliding_window_view(values, width)
+    valid = ~np.isnan(windows).any(axis=1)
+    ordered_weights = np.asarray(weights[::-1], dtype=float)
+    diffed = np.full(len(windows), np.nan, dtype=float)
+    diffed[valid] = windows[valid] @ ordered_weights
+    out[width - 1 :] = diffed
+    return pd.Series(out, index=series.index)
 
 
 def add_features_for_contract(group: pd.DataFrame, tick_size: float) -> pd.DataFrame:
@@ -166,6 +196,9 @@ def add_features_for_contract(group: pd.DataFrame, tick_size: float) -> pd.DataF
     g["price_oi_state"] = price_direction * np.sign(oi_change)
     g["delta_oi_agreement"] = delta_direction * np.sign(oi_change)
     g["oi_volume_ratio"] = safe_divide(oi_change, g["volume"], fill=0.0)
+    g["open_interest_fracdiff_04"] = fractional_diff(g["open_interest"], order=0.4)
+    g["open_interest_fracdiff_zscore_60"] = rolling_zscore(g["open_interest_fracdiff_04"], 60)
+    g["fracdiff_oi_delta_confirm"] = np.sign(g["open_interest_fracdiff_04"]) * delta_direction
 
     g["trend_return_12"] = g["close"] / g["close"].shift(12).replace(0, np.nan) - 1
     g["trend_return_48"] = g["close"] / g["close"].shift(48).replace(0, np.nan) - 1

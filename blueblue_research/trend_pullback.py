@@ -100,6 +100,11 @@ VALUE_LABELS = {
     "BLOCKER": "阻断",
     "WARNING": "警告",
     "OBSERVATION": "观察",
+    "fixed_time": "固定时间",
+    "triple_barrier": "三重屏障",
+    "take_profit": "止盈",
+    "stop_loss": "止损",
+    "time_barrier": "时间屏障",
     True: "是",
     False: "否",
 }
@@ -150,6 +155,10 @@ COLUMN_LABELS = {
     "month": "月份",
     "gross_return": "毛收益",
     "net_return": "净收益",
+    "exit_reason": "退出原因",
+    "exit_mode": "退出模式",
+    "stop_price_barrier": "止损屏障",
+    "take_profit_price_barrier": "止盈屏障",
     "feature": "特征",
     "group": "特征组",
     "formula_note": "公式说明",
@@ -171,6 +180,11 @@ class TrendPullbackConfig:
     reward_to_risk_threshold: float
     bootstrap_samples: int
     bootstrap_seed: int
+    bootstrap_block_size: int
+    exit_mode: str
+    stop_atr_multiple: float
+    take_profit_multiple: float
+    time_barrier_bars: Optional[int]
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> TrendPullbackConfig:
@@ -188,6 +202,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrendPullbackConfig:
     parser.add_argument("--reward_to_risk_threshold", type=float, default=1.5)
     parser.add_argument("--bootstrap_samples", type=int, default=1000)
     parser.add_argument("--bootstrap_seed", type=int, default=20260528)
+    parser.add_argument("--bootstrap_block_size", type=int, default=0, help="0表示按sqrt(N)自动选择 moving block bootstrap 块长")
+    parser.add_argument("--exit_mode", choices=["triple_barrier", "fixed"], default="triple_barrier")
+    parser.add_argument("--stop_atr_multiple", type=float, default=1.0)
+    parser.add_argument("--take_profit_multiple", type=float, default=2.0)
+    parser.add_argument("--time_barrier_bars", type=int, default=None, help="不填时等于 holding_bars")
     args = parser.parse_args(argv)
 
     stage2_dir = Path(args.stage2_dir).expanduser()
@@ -205,6 +224,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrendPullbackConfig:
         reward_to_risk_threshold=float(args.reward_to_risk_threshold),
         bootstrap_samples=int(args.bootstrap_samples),
         bootstrap_seed=int(args.bootstrap_seed),
+        bootstrap_block_size=int(args.bootstrap_block_size),
+        exit_mode=args.exit_mode,
+        stop_atr_multiple=float(args.stop_atr_multiple),
+        take_profit_multiple=float(args.take_profit_multiple),
+        time_barrier_bars=args.time_barrier_bars,
     )
 
 
@@ -249,18 +273,26 @@ def load_stage2_pack(config: TrendPullbackConfig) -> pd.DataFrame:
 
 
 def _rolling_trendline(close: pd.Series, tick_size: float, window: int = 60) -> Tuple[pd.Series, pd.Series]:
+    """向量化计算 rolling 线性回归趋势线，避免 pandas rolling.apply 的逐行开销。"""
+
     x = np.arange(window, dtype=float)
     x_centered = x - x.mean()
     denominator = float(np.square(x_centered).sum())
+    values = pd.to_numeric(close, errors="coerce").to_numpy(dtype=float)
+    slope = np.full(len(values), np.nan, dtype=float)
+    line = np.full(len(values), np.nan, dtype=float)
+    if len(values) < window:
+        return pd.Series(line, index=close.index), pd.Series(slope, index=close.index)
 
-    def slope(values: np.ndarray) -> float:
-        if np.isnan(values).any():
-            return np.nan
-        return float(np.dot(x_centered, values) / denominator)
-
-    slope_price = close.rolling(window, min_periods=window).apply(slope, raw=True)
-    line = close.rolling(window, min_periods=window).mean() + slope_price * (window - 1 - x.mean())
-    return line, slope_price / tick_size
+    windows = np.lib.stride_tricks.sliding_window_view(values, window)
+    valid = ~np.isnan(windows).any(axis=1)
+    slope_window = np.full(len(windows), np.nan, dtype=float)
+    line_window = np.full(len(windows), np.nan, dtype=float)
+    slope_window[valid] = windows[valid] @ x_centered / denominator
+    line_window[valid] = windows[valid].mean(axis=1) + slope_window[valid] * (window - 1 - x.mean())
+    slope[window - 1 :] = slope_window
+    line[window - 1 :] = line_window
+    return pd.Series(line, index=close.index), pd.Series(slope / tick_size, index=close.index)
 
 
 def add_trend_pullback_features_for_contract(group: pd.DataFrame, config: TrendPullbackConfig) -> pd.DataFrame:
@@ -393,7 +425,73 @@ def _metrics(trades: pd.DataFrame, split_name: str, return_col: str = "net_retur
     }
 
 
-def _generate_trades_for_signal(features: pd.DataFrame, stage2_config: Stage2Config, combo_name: str, signal_col: str) -> pd.DataFrame:
+def _resolve_long_exit(
+    group: pd.DataFrame,
+    signal_row: pd.Series,
+    signal_i: int,
+    entry_i: int,
+    entry_price: float,
+    stage2_config: Stage2Config,
+    config: TrendPullbackConfig,
+) -> Optional[Dict[str, Any]]:
+    time_bars = config.time_barrier_bars if config.time_barrier_bars is not None else stage2_config.holding_bars
+    exit_i = signal_i + time_bars
+    if exit_i >= len(group):
+        return None
+
+    if config.exit_mode == "fixed":
+        return {
+            "exit_i": exit_i,
+            "exit_datetime": group.loc[exit_i, "datetime"],
+            "exit_price": group.loc[exit_i, "close"],
+            "exit_reason": "fixed_time",
+            "stop_price_barrier": np.nan,
+            "take_profit_price_barrier": np.nan,
+        }
+
+    atr_ticks = signal_row.get("atr20_ticks", np.nan)
+    atr_price = atr_ticks * stage2_config.tick_size if pd.notna(atr_ticks) and atr_ticks > 0 else np.nan
+    signal_stop = signal_row.get("stop_price_signal", np.nan)
+    signal_stop_distance = entry_price - signal_stop if pd.notna(signal_stop) and signal_stop < entry_price else np.nan
+    atr_stop_distance = config.stop_atr_multiple * atr_price if pd.notna(atr_price) and atr_price > 0 else np.nan
+    stop_candidates = [value for value in (signal_stop_distance, atr_stop_distance, stage2_config.tick_size) if pd.notna(value) and value > 0]
+    if not stop_candidates:
+        return None
+    stop_distance = max(stop_candidates)
+    stop_price = entry_price - stop_distance
+    take_profit_price = entry_price + config.take_profit_multiple * stop_distance
+
+    # 同一根Bar同时触及止损和止盈时按保守口径先记止损。
+    for j in range(entry_i, exit_i + 1):
+        if group.loc[j, "low"] <= stop_price:
+            return {
+                "exit_i": j,
+                "exit_datetime": group.loc[j, "datetime"],
+                "exit_price": stop_price,
+                "exit_reason": "stop_loss",
+                "stop_price_barrier": stop_price,
+                "take_profit_price_barrier": take_profit_price,
+            }
+        if group.loc[j, "high"] >= take_profit_price:
+            return {
+                "exit_i": j,
+                "exit_datetime": group.loc[j, "datetime"],
+                "exit_price": take_profit_price,
+                "exit_reason": "take_profit",
+                "stop_price_barrier": stop_price,
+                "take_profit_price_barrier": take_profit_price,
+            }
+    return {
+        "exit_i": exit_i,
+        "exit_datetime": group.loc[exit_i, "datetime"],
+        "exit_price": group.loc[exit_i, "close"],
+        "exit_reason": "time_barrier",
+        "stop_price_barrier": stop_price,
+        "take_profit_price_barrier": take_profit_price,
+    }
+
+
+def _generate_trades_for_signal(features: pd.DataFrame, stage2_config: Stage2Config, config: TrendPullbackConfig, combo_name: str, signal_col: str) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for contract, group in features.groupby("contract", sort=True):
         g = group.sort_values("datetime").reset_index(drop=True)
@@ -402,15 +500,18 @@ def _generate_trades_for_signal(features: pd.DataFrame, stage2_config: Stage2Con
             if i < next_allowed_i or not bool(row.get(signal_col, False)) or not bool(row.get("trade_ready", False)):
                 continue
             entry_i = i + 1
-            exit_i = i + stage2_config.holding_bars
-            if exit_i >= len(g) or entry_i >= len(g):
+            if entry_i >= len(g):
                 continue
             entry_price = g.loc[entry_i, "open"]
-            exit_price = g.loc[exit_i, "close"]
-            exit_datetime = g.loc[exit_i, "datetime"]
-            if row["datetime"] <= stage2_config.train_end and exit_datetime >= stage2_config.test_start:
+            if pd.isna(entry_price) or entry_price == 0:
                 continue
-            if pd.isna(entry_price) or pd.isna(exit_price) or entry_price == 0:
+            exit_info = _resolve_long_exit(g, row, i, entry_i, entry_price, stage2_config, config)
+            if exit_info is None:
+                continue
+            exit_price = exit_info["exit_price"]
+            if pd.isna(exit_price):
+                continue
+            if row["datetime"] <= stage2_config.train_end and exit_info["exit_datetime"] >= stage2_config.test_start:
                 continue
             gross_return = exit_price / entry_price - 1.0
             net_return = gross_return - stage2_config.roundtrip_cost_price / entry_price
@@ -421,12 +522,16 @@ def _generate_trades_for_signal(features: pd.DataFrame, stage2_config: Stage2Con
                     "side": "long",
                     "signal_datetime": row["datetime"],
                     "entry_datetime": g.loc[entry_i, "datetime"],
-                    "exit_datetime": exit_datetime,
+                    "exit_datetime": exit_info["exit_datetime"],
                     "entry_price": entry_price,
                     "exit_price": exit_price,
                     "gross_return": gross_return,
                     "net_return": net_return,
-                    "holding_bars": stage2_config.holding_bars,
+                    "holding_bars": int(exit_info["exit_i"] - entry_i + 1),
+                    "exit_mode": config.exit_mode,
+                    "exit_reason": exit_info["exit_reason"],
+                    "stop_price_barrier": exit_info["stop_price_barrier"],
+                    "take_profit_price_barrier": exit_info["take_profit_price_barrier"],
                     "split": "train" if row["datetime"] <= stage2_config.train_end else "test",
                     "stop_price_signal": row.get("stop_price_signal", np.nan),
                     "stop_distance_ticks_signal": row.get("stop_distance_ticks_signal", np.nan),
@@ -434,14 +539,14 @@ def _generate_trades_for_signal(features: pd.DataFrame, stage2_config: Stage2Con
                     "reward_to_risk_proxy": row.get("reward_to_risk_proxy", np.nan),
                 }
             )
-            next_allowed_i = i + stage2_config.holding_bars
+            next_allowed_i = exit_info["exit_i"] + 1
     return pd.DataFrame(rows)
 
 
-def generate_long_trades(features: pd.DataFrame, stage2_config: Stage2Config) -> pd.DataFrame:
+def generate_long_trades(features: pd.DataFrame, stage2_config: Stage2Config, config: TrendPullbackConfig) -> pd.DataFrame:
     frames = []
     for combo in COMBO_DEFINITIONS:
-        trades = _generate_trades_for_signal(features, stage2_config, combo["combo_name"], f"{combo['combo_name']}_pass")
+        trades = _generate_trades_for_signal(features, stage2_config, config, combo["combo_name"], f"{combo['combo_name']}_pass")
         if not trades.empty:
             frames.append(trades)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -525,7 +630,7 @@ def build_cost_sensitivity(trades: pd.DataFrame, tick_size: float) -> pd.DataFra
     return pd.DataFrame(rows)
 
 
-def build_reward_risk_sensitivity(features: pd.DataFrame, stage2_config: Stage2Config) -> pd.DataFrame:
+def build_reward_risk_sensitivity(features: pd.DataFrame, stage2_config: Stage2Config, config: TrendPullbackConfig) -> pd.DataFrame:
     """只针对完整趋势回调链条，比较不同盈亏比阈值下的结果。"""
 
     rows: List[Dict[str, Any]] = []
@@ -540,7 +645,7 @@ def build_reward_risk_sensitivity(features: pd.DataFrame, stage2_config: Stage2C
             & (work["stop_distance_ticks_signal"] <= 30.0)
             & (work["reward_to_risk_proxy"] >= threshold)
         )
-        trades = _generate_trades_for_signal(work, stage2_config, "trend_pullback_full_space", signal_col)
+        trades = _generate_trades_for_signal(work, stage2_config, config, "trend_pullback_full_space", signal_col)
         for split in ("train", "test", "all"):
             part = trades if split == "all" else trades[trades["split"] == split] if not trades.empty else trades
             row = _metrics(part, split)
@@ -608,16 +713,28 @@ def _two_proportion_p_value(wins_a: int, n_a: int, wins_b: int, n_b: int) -> Tup
     return float(z), float(p_value)
 
 
-def _bootstrap_mean_diff_ci(current: pd.Series, benchmark: pd.Series, samples: int, seed: int) -> Tuple[float, float]:
+def _moving_block_sample(values: np.ndarray, block_size: int, target_size: int, rng: np.random.Generator) -> np.ndarray:
+    n = len(values)
+    if n == 0:
+        return values
+    block = max(1, min(block_size, n))
+    starts = rng.integers(0, n - block + 1, size=int(math.ceil(target_size / block)))
+    sampled = np.concatenate([values[start : start + block] for start in starts])
+    return sampled[:target_size]
+
+
+def _bootstrap_mean_diff_ci(current: pd.Series, benchmark: pd.Series, samples: int, seed: int, block_size: int = 0) -> Tuple[float, float]:
     current_values = pd.to_numeric(current, errors="coerce").dropna().to_numpy(dtype=float)
     benchmark_values = pd.to_numeric(benchmark, errors="coerce").dropna().to_numpy(dtype=float)
     if len(current_values) == 0 or len(benchmark_values) == 0:
         return np.nan, np.nan
     rng = np.random.default_rng(seed)
+    if block_size <= 0:
+        block_size = max(5, int(round(math.sqrt(min(len(current_values), len(benchmark_values))))))
     diffs = np.empty(samples, dtype=float)
     for i in range(samples):
-        current_sample = rng.choice(current_values, size=len(current_values), replace=True)
-        benchmark_sample = rng.choice(benchmark_values, size=len(benchmark_values), replace=True)
+        current_sample = _moving_block_sample(current_values, block_size, len(current_values), rng)
+        benchmark_sample = _moving_block_sample(benchmark_values, block_size, len(benchmark_values), rng)
         diffs[i] = current_sample.mean() - benchmark_sample.mean()
     return float(np.quantile(diffs, 0.025)), float(np.quantile(diffs, 0.975))
 
@@ -677,7 +794,13 @@ def add_gain_diagnostics(summary: pd.DataFrame, trades: pd.DataFrame, monthly: p
                 int((base_part["net_return"] > 0).sum()),
                 len(base_part),
             )
-            low, high = _bootstrap_mean_diff_ci(current_part["net_return"], base_part["net_return"], config.bootstrap_samples, config.bootstrap_seed)
+            low, high = _bootstrap_mean_diff_ci(
+                current_part.sort_values("exit_datetime")["net_return"],
+                base_part.sort_values("exit_datetime")["net_return"],
+                config.bootstrap_samples,
+                config.bootstrap_seed,
+                config.bootstrap_block_size,
+            )
             out.loc[idx, "win_rate_diff_z"] = z
             out.loc[idx, "win_rate_diff_p_value"] = p_value
             out.loc[idx, "avg_net_diff_bootstrap_ci95_low"] = low
@@ -829,6 +952,7 @@ def _explain_combo(row: pd.Series) -> str:
 
 def write_report(
     output_path: Path,
+    config: TrendPullbackConfig,
     stage2_config: Stage2Config,
     features: pd.DataFrame,
     filter_counts: pd.DataFrame,
@@ -855,6 +979,8 @@ def write_report(
     lines.append(f"- 趋势回调做多完整链条：`{conclusion}`。")
     lines.append(f"- 审计阻断项：`{len(blockers)}`。")
     lines.append("- 回踩结构使用 `±0.5 * ATR20` 自适应容差，不再使用固定 tick 容差。")
+    lines.append(f"- 退出机制：`{VALUE_LABELS.get(config.exit_mode, config.exit_mode)}`；Triple Barrier 使用 ATR 止损倍数 `{config.stop_atr_multiple}`、止盈倍数 `{config.take_profit_multiple}`、时间屏障 `{config.time_barrier_bars or stage2_config.holding_bars}` 根Bar。")
+    lines.append("- 平均净收益差的置信区间使用 moving block bootstrap，保留交易收益的时间依赖结构。")
     lines.append(f"- 数据范围：`{features['datetime'].min()}` 到 `{features['datetime'].max()}`，合约数 `{features['contract'].nunique()}`，样本行数 `{len(features)}`。")
     lines.append(f"- 训练/测试切分：训练集截至 `{stage2_config.train_end}`，测试集从 `{stage2_config.test_start}` 开始。")
     lines.append("")
@@ -935,13 +1061,13 @@ def run(config: Optional[TrendPullbackConfig] = None) -> Dict[str, Any]:
     data = load_stage2_pack(config)
     stage2_config = make_stage2_config(config, data)
     features = build_trend_pullback_features(data, config)
-    trades = generate_long_trades(features, stage2_config)
+    trades = generate_long_trades(features, stage2_config, config)
     filter_counts = build_filter_counts(features, stage2_config)
     summary = build_summary(trades)
     monthly = build_monthly_metrics(trades)
     sample_confidence = build_sample_confidence(summary)
     cost_sensitivity = build_cost_sensitivity(trades, stage2_config.tick_size)
-    reward_risk_sensitivity = build_reward_risk_sensitivity(features, stage2_config)
+    reward_risk_sensitivity = build_reward_risk_sensitivity(features, stage2_config, config)
     summary = add_gain_diagnostics(summary, trades, monthly, sample_confidence, config)
     audit = run_audit(features, trades, summary, stage2_config)
 
@@ -960,6 +1086,7 @@ def run(config: Optional[TrendPullbackConfig] = None) -> Dict[str, Any]:
     write_csv(audit, output_dir / "trend_pullback_gain_audit.csv")
     write_report(
         output_dir / "trend_pullback_gain_report_zh.md",
+        config,
         stage2_config,
         features,
         filter_counts,
