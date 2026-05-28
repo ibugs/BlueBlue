@@ -223,6 +223,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--space_filters", type=str, default="off,on")
     parser.add_argument("--sides", type=str, default=",".join(DEFAULT_SIDES))
     parser.add_argument("--max_train_rank", type=int, default=10)
+    parser.add_argument("--report_tag", type=str, default="", help="可选；非空时生成带 tag 的 Markdown 报告文件名，避免覆盖旧报告")
     return parser.parse_args(argv)
 
 
@@ -1259,6 +1260,7 @@ def run_side(
     parameter_grid: pd.DataFrame,
     output_dir: Path,
     max_train_rank: int,
+    report_tag: str = "",
 ) -> Dict[str, Any]:
     side_grid = _side_parameter_grid(parameter_grid, side)
     trade_frames: List[pd.DataFrame] = []
@@ -1293,8 +1295,11 @@ def run_side(
     write_csv(stop_take_diag, output_dir / "trend_pullback_stop_take_diagnostics.csv")
     write_csv(monthly, output_dir / "trend_pullback_sweep_monthly.csv")
     write_csv(audit, output_dir / "trend_pullback_sweep_audit.csv")
+    report_name = "trend_pullback_sweep_report_zh.md"
+    if report_tag:
+        report_name = f"trend_pullback_sweep_{side}_report_{report_tag}_zh.md"
     write_report(
-        output_dir / "trend_pullback_sweep_report_zh.md",
+        output_dir / report_name,
         side,
         features,
         stage2_config,
@@ -1612,8 +1617,9 @@ def run(args: Optional[argparse.Namespace] = None) -> Dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     side_results: Dict[str, Dict[str, Any]] = {}
+    report_tag = str(getattr(args, "report_tag", "") or "").strip()
     for side in sides:
-        side_results[side] = run_side(side, features, stage2_config, base_config, parameter_grid, output_dir / side, int(args.max_train_rank))
+        side_results[side] = run_side(side, features, stage2_config, base_config, parameter_grid, output_dir / side, int(args.max_train_rank), report_tag)
 
     summary_dir = output_dir / "summary"
     summary_dir.mkdir(parents=True, exist_ok=True)
@@ -1627,8 +1633,11 @@ def run(args: Optional[argparse.Namespace] = None) -> Dict[str, Any]:
     write_csv(exit_comparison, summary_dir / "long_short_exit_reason_comparison.csv")
     write_csv(asymmetry, summary_dir / "long_short_asymmetry.csv")
     write_csv(summary_audit, summary_dir / "long_short_audit.csv")
+    summary_report_name = "trend_pullback_sweep_long_short_summary_zh.md"
+    if report_tag:
+        summary_report_name = f"trend_pullback_sweep_long_short_summary_{report_tag}_zh.md"
     write_long_short_summary_report(
-        summary_dir / "trend_pullback_sweep_long_short_summary_zh.md",
+        summary_dir / summary_report_name,
         features,
         stage2_config,
         parameter_grid,
