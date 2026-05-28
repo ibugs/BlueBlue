@@ -85,8 +85,26 @@ FEATURE_SPECS: List[Dict[str, str]] = [
     {"feature": "volatility_adjusted_flow", "group": "interaction", "description": "波动调整后的订单流强度", "formula_note": "delta_strength/volatility_20"},
 ]
 
+FEATURE_TYPE_OVERRIDES = {
+    "volume_burst_flag": "binary_flag",
+    "is_night_session": "binary_flag",
+    "close_above_poc": "signed_flag",
+    "delta_price_agreement": "signed_flag",
+    "poc_price_agreement": "signed_flag",
+    "price_oi_state": "signed_flag",
+    "delta_oi_agreement": "signed_flag",
+    "fracdiff_oi_delta_confirm": "signed_flag",
+    "minute_of_day_sin": "cyclical",
+    "minute_of_day_cos": "cyclical",
+}
+PASSTHROUGH_FEATURE_TYPES = {"binary_flag", "signed_flag", "cyclical"}
+
+for spec in FEATURE_SPECS:
+    spec["feature_type"] = FEATURE_TYPE_OVERRIDES.get(spec["feature"], "continuous")
+
 FEATURE_COLUMNS = [item["feature"] for item in FEATURE_SPECS]
 FEATURE_GROUP_MAP = {item["feature"]: item["group"] for item in FEATURE_SPECS}
+FEATURE_TYPE_MAP = {item["feature"]: item["feature_type"] for item in FEATURE_SPECS}
 
 
 def feature_catalog() -> pd.DataFrame:
@@ -248,6 +266,14 @@ def _fit_one_transform(train_values: pd.Series) -> Dict[str, Any]:
     return {"lower": lower, "upper": upper, "center": median, "scale": np.nan, "scale_type": "constant"}
 
 
+def _passthrough_transform(feature_type: str) -> Dict[str, Any]:
+    return {"lower": np.nan, "upper": np.nan, "center": 0.0, "scale": 1.0, "scale_type": "passthrough", "feature_type": feature_type}
+
+
+def _is_passthrough_feature(feature: str) -> bool:
+    return FEATURE_TYPE_MAP.get(feature, "continuous") in PASSTHROUGH_FEATURE_TYPES
+
+
 def fit_transform_features(features: pd.DataFrame, config: Stage2Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """用训练集拟合每个合约的 winsorize/标准化参数，并返回裁剪后的特征。"""
 
@@ -256,7 +282,9 @@ def fit_transform_features(features: pd.DataFrame, config: Stage2Config) -> Tupl
     train_all_mask = cleaned["datetime"] <= config.train_end
     global_params: Dict[str, Dict[str, Any]] = {}
     for feature in FEATURE_COLUMNS:
-        params = _fit_one_transform(cleaned.loc[train_all_mask, feature])
+        feature_type = FEATURE_TYPE_MAP.get(feature, "continuous")
+        params = _passthrough_transform(feature_type) if _is_passthrough_feature(feature) else _fit_one_transform(cleaned.loc[train_all_mask, feature])
+        params["feature_type"] = feature_type
         params.update({"contract": "__GLOBAL__", "feature": feature, "param_source": "global_train"})
         global_params[feature] = params.copy()
         rows.append(params)
@@ -265,12 +293,21 @@ def fit_transform_features(features: pd.DataFrame, config: Stage2Config) -> Tupl
         contract_idx = list(idx)
         train_mask = (cleaned.loc[contract_idx, "datetime"] <= config.train_end)
         for feature in FEATURE_COLUMNS:
+            feature_type = FEATURE_TYPE_MAP.get(feature, "continuous")
+            if _is_passthrough_feature(feature):
+                params = _passthrough_transform(feature_type)
+                params["param_source"] = "passthrough"
+                params.update({"contract": contract, "feature": feature})
+                rows.append(params)
+                continue
+
             params = _fit_one_transform(cleaned.loc[contract_idx, feature][train_mask])
             if params["scale_type"] == "none" or pd.isna(params["lower"]) or pd.isna(params["upper"]):
                 params = global_params[feature].copy()
                 params["param_source"] = "global_fallback_no_contract_train"
             else:
                 params["param_source"] = "contract_train"
+            params["feature_type"] = feature_type
             params.update({"contract": contract, "feature": feature})
             rows.append(params)
             if pd.notna(params["lower"]) and pd.notna(params["upper"]):
@@ -291,9 +328,12 @@ def standardize_selected_features(features: pd.DataFrame, transform_params: pd.D
         values = pd.Series(np.nan, index=features.index, dtype=float)
         for contract, idx in features.groupby("contract").groups.items():
             params = param_map.get((contract, feature))
+            raw = pd.to_numeric(features.loc[idx, feature], errors="coerce")
+            if params is not None and params.get("scale_type") == "passthrough":
+                values.loc[idx] = raw
+                continue
             if params is None or pd.isna(params["scale"]) or params["scale"] == 0:
                 continue
-            raw = pd.to_numeric(features.loc[idx, feature], errors="coerce")
             values.loc[idx] = (raw - float(params["center"])) / float(params["scale"])
         z[feature] = values
     return z.replace([np.inf, -np.inf], np.nan)

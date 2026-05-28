@@ -628,6 +628,7 @@ def _build_bar_lookup(features: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
         dt_index = pd.Index(g["datetime"])
         lookup[contract] = {
             "index": {value: i for i, value in enumerate(dt_index)},
+            "open": g["open"].to_numpy(dtype=float),
             "high": g["high"].to_numpy(dtype=float),
             "low": g["low"].to_numpy(dtype=float),
             "close": g["close"].to_numpy(dtype=float),
@@ -675,7 +676,7 @@ def _validate_barrier_path_sample(
                     if side == "short":
                         if data["high"][pos] >= stop_price:
                             expected_reason = "stop_loss"
-                            expected_exit_price = stop_price
+                            expected_exit_price = max(data["open"][pos], stop_price) if np.isfinite(data["open"][pos]) else stop_price
                             break
                         if data["low"][pos] <= take_price:
                             expected_reason = "take_profit"
@@ -684,7 +685,7 @@ def _validate_barrier_path_sample(
                     else:
                         if data["low"][pos] <= stop_price:
                             expected_reason = "stop_loss"
-                            expected_exit_price = stop_price
+                            expected_exit_price = min(data["open"][pos], stop_price) if np.isfinite(data["open"][pos]) else stop_price
                             break
                         if data["high"][pos] >= take_price:
                             expected_reason = "take_profit"

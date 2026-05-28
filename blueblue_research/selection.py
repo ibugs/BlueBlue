@@ -16,6 +16,9 @@ import pandas as pd
 from .config import Stage2Config
 from .features import FEATURE_GROUP_MAP
 
+MRMR_REDUNDANCY_PENALTY = 0.8
+MRMR_DIVERSITY_BONUS = 0.15
+
 
 def _corr_lookup(corr_pairs: pd.DataFrame) -> Dict[tuple, float]:
     out: Dict[tuple, float] = {}
@@ -53,6 +56,19 @@ def _candidate_pool(feature_summary_train: pd.DataFrame) -> pd.DataFrame:
     return pool.sort_values("abs_spearman_ic_5", ascending=False).reset_index(drop=True)
 
 
+def _ic_scale(pool: pd.DataFrame) -> float:
+    values = pd.to_numeric(pool["abs_spearman_ic_5"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if values.empty:
+        return 1e-6
+    median = float(values.median())
+    if math.isfinite(median) and median > 0:
+        return median
+    mean = float(values.mean())
+    if math.isfinite(mean) and mean > 0:
+        return mean
+    return 1e-6
+
+
 def select_features(feature_summary_train: pd.DataFrame, corr_pairs: pd.DataFrame, config: Stage2Config) -> pd.DataFrame:
     """选择低冗余且覆盖多个维度的特征。
 
@@ -66,6 +82,7 @@ def select_features(feature_summary_train: pd.DataFrame, corr_pairs: pd.DataFram
     selected_rows: List[dict] = []
     selected_set: Set[str] = set()
     group_cap = max(1, math.floor(config.max_selected_features * config.max_group_share))
+    ic_scale = _ic_scale(pool)
 
     def can_add(feature: str) -> bool:
         if feature in selected_set:
@@ -114,8 +131,8 @@ def select_features(feature_summary_train: pd.DataFrame, corr_pairs: pd.DataFram
             redundancy = _mean_corr_to_selected(feature, selected, corr_map)
             group = FEATURE_GROUP_MAP[feature]
             group_counts = Counter(FEATURE_GROUP_MAP[x] for x in selected)
-            diversity_bonus = 0.10 if group_counts[group] == 0 else 0.0
-            score = float(row["abs_spearman_ic_5"]) * (1.0 - 0.5 * redundancy + diversity_bonus)
+            diversity_bonus = MRMR_DIVERSITY_BONUS if group_counts[group] == 0 else 0.0
+            score = float(row["abs_spearman_ic_5"]) - MRMR_REDUNDANCY_PENALTY * redundancy * ic_scale + diversity_bonus * ic_scale
             if score > best_score:
                 best_score = score
                 best_row = row
@@ -131,4 +148,7 @@ def select_features(feature_summary_train: pd.DataFrame, corr_pairs: pd.DataFram
     selected_df["max_group_share_actual"] = selected_df["group"].value_counts(normalize=True).max()
     selected_df["corr_threshold"] = config.corr_threshold
     selected_df["max_group_share_limit"] = config.max_group_share
+    selected_df["mrmr_redundancy_penalty"] = MRMR_REDUNDANCY_PENALTY
+    selected_df["mrmr_diversity_bonus"] = MRMR_DIVERSITY_BONUS
+    selected_df["mrmr_ic_scale"] = ic_scale
     return selected_df

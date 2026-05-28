@@ -464,10 +464,12 @@ def _resolve_long_exit(
     # 同一根Bar同时触及止损和止盈时按保守口径先记止损。
     for j in range(entry_i, exit_i + 1):
         if group.loc[j, "low"] <= stop_price:
+            open_price = group.loc[j, "open"]
+            stop_exit_price = min(open_price, stop_price) if pd.notna(open_price) else stop_price
             return {
                 "exit_i": j,
                 "exit_datetime": group.loc[j, "datetime"],
-                "exit_price": stop_price,
+                "exit_price": stop_exit_price,
                 "exit_reason": "stop_loss",
                 "stop_price_barrier": stop_price,
                 "take_profit_price_barrier": take_profit_price,

@@ -487,7 +487,11 @@ def _precompute_exit_vectors(
             stop_hit = active & (highs[j.clip(max=n - 1)] >= stop_price)
         if stop_hit.any():
             exit_i[stop_hit] = j[stop_hit]
-            exit_price[stop_hit] = stop_price[stop_hit]
+            open_at_stop = opens[j[stop_hit]]
+            if side == "long":
+                exit_price[stop_hit] = np.where(np.isfinite(open_at_stop), np.minimum(open_at_stop, stop_price[stop_hit]), stop_price[stop_hit])
+            else:
+                exit_price[stop_hit] = np.where(np.isfinite(open_at_stop), np.maximum(open_at_stop, stop_price[stop_hit]), stop_price[stop_hit])
             reason_code[stop_hit] = 2
             resolved[stop_hit] = True
         active = (~resolved) & in_range
